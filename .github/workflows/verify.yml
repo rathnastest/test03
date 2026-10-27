@@ -1,0 +1,82 @@
+name: Verify user template
+
+# Checks this repository against the publish toolchain its caller workflow
+# pins: caller <-> lock <-> toolchain, built through the toolchain's own
+# repository intake. Runs only in rathnasgala2/user-template, never in sites
+# created from it. The private api repository is not available here, so the
+# API import-fixture check reports SKIP in CI and is enforced in local runs.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify user template
+    if: github.repository == 'rathnasgala2/user-template'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          path: user-template
+      - name: Read the publish toolchain pin from the caller
+        id: pin
+        run: |
+          set -euo pipefail
+          ref="$(sed -n 's/^[[:space:]]*publish_toolchain_ref:[[:space:]]*\([0-9a-f]\{40\}\)[[:space:]]*$/\1/p' user-template/.github/workflows/gala-publish-v2.yml)"
+          if [ "$(printf '%s\n' "$ref" | grep -c .)" -ne 1 ]; then
+            echo "expected exactly one 40-hex publish_toolchain_ref in the caller" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: rathnasgala2/publish
+          ref: ${{ steps.pin.outputs.ref }}
+          persist-credentials: false
+          path: publish
+          fetch-depth: 0
+      - name: Fetch the docs caller from publish main
+        working-directory: publish
+        env:
+          PINNED: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$PINNED" FETCH_HEAD; then
+            echo "pinned toolchain $PINNED is not an ancestor of publish main" >&2
+            exit 1
+          fi
+          git show FETCH_HEAD:docs/callers/gala-publish-v2.yml > "$RUNNER_TEMP/docs-caller.yml"
+          echo "GALA_DOCS_CALLER_PATH=$RUNNER_TEMP/docs-caller.yml" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: publish/.node-version
+      - name: Install the publish toolchain
+        working-directory: publish
+        run: npm ci --ignore-scripts
+      - name: Assemble the workspace layout the verifier expects
+        run: |
+          set -euo pipefail
+          ws="$RUNNER_TEMP/ws"
+          mkdir -p "$ws"
+          ln -s "$GITHUB_WORKSPACE/publish" "$ws/publish"
+          ln -s "$GITHUB_WORKSPACE/publish/node_modules" "$ws/node_modules"
+          scope="$GITHUB_WORKSPACE/publish/node_modules/@rathnasgala2"
+          cp -RL "$scope/schemas" "$ws/schema"
+          cp -RL "$scope/template" "$ws/template"
+          cp -RL "$scope/theme-default" "$ws/theme-default"
+          echo "WORKSPACE_ROOT=$ws" >> "$GITHUB_ENV"
+      - name: Verify the user template
+        working-directory: user-template
+        run: node .user-template/scripts/verify-user-template.mjs
